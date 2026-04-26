@@ -251,6 +251,74 @@ app.post('/api/movements', authMiddleware, async (req, res) => {
   }
 });
 
+app.put('/api/movements/:id', authMiddleware, async (req, res) => {
+  try {
+    const {
+      type,
+      concept,
+      category,
+      amount,
+      date,
+      isRecurring = false,
+      recurringDay = null,
+      recurringParentId = null,
+      isShoppingMovement = false,
+      createdAutomatically = false,
+    } = req.body;
+
+    const result = await pool.query(
+      `UPDATE movements
+       SET type = $1,
+           concept = $2,
+           category = $3,
+           amount = $4,
+           date = $5,
+           is_recurring = $6,
+           recurring_day = $7,
+           recurring_parent_id = $8,
+           is_shopping_movement = $9,
+           created_automatically = $10
+       WHERE id = $11 AND user_id = $12
+       RETURNING
+        id,
+        user_id AS "userId",
+        type,
+        concept,
+        category,
+        amount,
+        TO_CHAR(date, 'YYYY-MM-DD') AS date,
+        is_recurring AS "isRecurring",
+        recurring_day AS "recurringDay",
+        recurring_parent_id AS "recurringParentId",
+        is_shopping_movement AS "isShoppingMovement",
+        created_automatically AS "createdAutomatically"`,
+      [
+        type,
+        concept,
+        category,
+        amount,
+        date,
+        isRecurring,
+        recurringDay,
+        recurringParentId,
+        isShoppingMovement,
+        createdAutomatically,
+        req.params.id,
+        req.user.id,
+      ],
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Movimiento no encontrado' });
+    }
+
+    return res.json(result.rows[0]);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: 'Error al actualizar movimiento' });
+  }
+});
+
 app.delete('/api/movements/:id', authMiddleware, async (req, res) => {
   try {
     await pool.query('DELETE FROM movements WHERE id = $1 AND user_id = $2', [req.params.id, req.user.id]);
