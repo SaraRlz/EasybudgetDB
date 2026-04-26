@@ -44,8 +44,24 @@ async function initDatabase() {
       recurring_parent_id INTEGER,
       is_shopping_movement BOOLEAN DEFAULT false,
       created_automatically BOOLEAN DEFAULT false,
+      products JSONB DEFAULT '[]',
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
+  `);
+
+  await pool.query(`
+    ALTER TABLE movements
+    ADD COLUMN IF NOT EXISTS is_shopping_movement BOOLEAN DEFAULT false;
+  `);
+
+  await pool.query(`
+    ALTER TABLE movements
+    ADD COLUMN IF NOT EXISTS created_automatically BOOLEAN DEFAULT false;
+  `);
+
+  await pool.query(`
+    ALTER TABLE movements
+    ADD COLUMN IF NOT EXISTS products JSONB DEFAULT '[]';
   `);
 
   await pool.query(`
@@ -180,10 +196,11 @@ app.get('/api/movements', authMiddleware, async (req, res) => {
         recurring_day AS "recurringDay",
         recurring_parent_id AS "recurringParentId",
         is_shopping_movement AS "isShoppingMovement",
-        created_automatically AS "createdAutomatically"
+        created_automatically AS "createdAutomatically",
+        products
       FROM movements
       WHERE user_id = $1
-      ORDER BY date DESC`,
+      ORDER BY date DESC, id DESC`,
       [req.user.id],
     );
 
@@ -207,15 +224,29 @@ app.post('/api/movements', authMiddleware, async (req, res) => {
       recurringParentId = null,
       isShoppingMovement = false,
       createdAutomatically = false,
+      products = [],
     } = req.body;
+
+    if (!type || !concept || !category || !amount || !date) {
+      return res.status(400).json({ message: 'Faltan datos obligatorios del movimiento' });
+    }
 
     const result = await pool.query(
       `INSERT INTO movements (
-        user_id, type, concept, category, amount, date,
-        is_recurring, recurring_day, recurring_parent_id,
-        is_shopping_movement, created_automatically
+        user_id,
+        type,
+        concept,
+        category,
+        amount,
+        date,
+        is_recurring,
+        recurring_day,
+        recurring_parent_id,
+        is_shopping_movement,
+        created_automatically,
+        products
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
       RETURNING 
         id,
         user_id AS "userId",
@@ -228,7 +259,8 @@ app.post('/api/movements', authMiddleware, async (req, res) => {
         recurring_day AS "recurringDay",
         recurring_parent_id AS "recurringParentId",
         is_shopping_movement AS "isShoppingMovement",
-        created_automatically AS "createdAutomatically"`,
+        created_automatically AS "createdAutomatically",
+        products`,
       [
         req.user.id,
         type,
@@ -241,6 +273,7 @@ app.post('/api/movements', authMiddleware, async (req, res) => {
         recurringParentId,
         isShoppingMovement,
         createdAutomatically,
+        JSON.stringify(products),
       ],
     );
 
@@ -264,7 +297,12 @@ app.put('/api/movements/:id', authMiddleware, async (req, res) => {
       recurringParentId = null,
       isShoppingMovement = false,
       createdAutomatically = false,
+      products = [],
     } = req.body;
+
+    if (!type || !concept || !category || !amount || !date) {
+      return res.status(400).json({ message: 'Faltan datos obligatorios del movimiento' });
+    }
 
     const result = await pool.query(
       `UPDATE movements
@@ -277,8 +315,9 @@ app.put('/api/movements/:id', authMiddleware, async (req, res) => {
            recurring_day = $7,
            recurring_parent_id = $8,
            is_shopping_movement = $9,
-           created_automatically = $10
-       WHERE id = $11 AND user_id = $12
+           created_automatically = $10,
+           products = $11
+       WHERE id = $12 AND user_id = $13
        RETURNING
         id,
         user_id AS "userId",
@@ -291,7 +330,8 @@ app.put('/api/movements/:id', authMiddleware, async (req, res) => {
         recurring_day AS "recurringDay",
         recurring_parent_id AS "recurringParentId",
         is_shopping_movement AS "isShoppingMovement",
-        created_automatically AS "createdAutomatically"`,
+        created_automatically AS "createdAutomatically",
+        products`,
       [
         type,
         concept,
@@ -303,6 +343,7 @@ app.put('/api/movements/:id', authMiddleware, async (req, res) => {
         recurringParentId,
         isShoppingMovement,
         createdAutomatically,
+        JSON.stringify(products),
         req.params.id,
         req.user.id,
       ],
@@ -327,6 +368,108 @@ app.delete('/api/movements/:id', authMiddleware, async (req, res) => {
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: 'Error al eliminar movimiento' });
+  }
+});
+
+app.get('/api/budgets', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT
+        id,
+        user_id AS "userId",
+        month,
+        category,
+        limit_amount AS "limit",
+        created_at AS "createdAt"
+      FROM budgets
+      WHERE user_id = $1
+      ORDER BY month DESC, category ASC`,
+      [req.user.id],
+    );
+
+    return res.json(result.rows);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: 'Error al obtener presupuestos' });
+  }
+});
+
+app.post('/api/budgets', authMiddleware, async (req, res) => {
+  try {
+    const { month, category, limit } = req.body;
+
+    if (!month || !category || !limit || Number(limit) <= 0) {
+      return res.status(400).json({ message: 'Datos de presupuesto inválidos' });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO budgets (
+        user_id,
+        month,
+        category,
+        limit_amount
+      )
+      VALUES ($1,$2,$3,$4)
+      RETURNING
+        id,
+        user_id AS "userId",
+        month,
+        category,
+        limit_amount AS "limit",
+        created_at AS "createdAt"`,
+      [req.user.id, month, category, limit],
+    );
+
+    return res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: 'Error al crear presupuesto' });
+  }
+});
+
+app.put('/api/budgets/:id', authMiddleware, async (req, res) => {
+  try {
+    const { month, category, limit } = req.body;
+
+    if (!month || !category || !limit || Number(limit) <= 0) {
+      return res.status(400).json({ message: 'Datos de presupuesto inválidos' });
+    }
+
+    const result = await pool.query(
+      `UPDATE budgets
+       SET month = $1,
+           category = $2,
+           limit_amount = $3
+       WHERE id = $4 AND user_id = $5
+       RETURNING
+        id,
+        user_id AS "userId",
+        month,
+        category,
+        limit_amount AS "limit",
+        created_at AS "createdAt"`,
+      [month, category, limit, req.params.id, req.user.id],
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Presupuesto no encontrado' });
+    }
+
+    return res.json(result.rows[0]);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: 'Error al actualizar presupuesto' });
+  }
+});
+
+app.delete('/api/budgets/:id', authMiddleware, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM budgets WHERE id = $1 AND user_id = $2', [req.params.id, req.user.id]);
+
+    return res.json({ message: 'Presupuesto eliminado' });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: 'Error al eliminar presupuesto' });
   }
 });
 
