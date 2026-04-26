@@ -50,21 +50,6 @@ async function initDatabase() {
   `);
 
   await pool.query(`
-    ALTER TABLE movements
-    ADD COLUMN IF NOT EXISTS is_shopping_movement BOOLEAN DEFAULT false;
-  `);
-
-  await pool.query(`
-    ALTER TABLE movements
-    ADD COLUMN IF NOT EXISTS created_automatically BOOLEAN DEFAULT false;
-  `);
-
-  await pool.query(`
-    ALTER TABLE movements
-    ADD COLUMN IF NOT EXISTS products JSONB DEFAULT '[]';
-  `);
-
-  await pool.query(`
     CREATE TABLE IF NOT EXISTS budgets (
       id SERIAL PRIMARY KEY,
       user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -113,34 +98,29 @@ app.post('/api/auth/register', async (req, res) => {
   try {
     const { name, email, password } = req.body;
 
-    if (!name || !email || !password) {
-      return res.status(400).json({ message: 'Faltan datos obligatorios' });
-    }
-
     const normalizedEmail = email.trim().toLowerCase();
 
-    const existingUser = await pool.query('SELECT id FROM users WHERE email = $1', [normalizedEmail]);
+    const exists = await pool.query('SELECT id FROM users WHERE email = $1', [normalizedEmail]);
 
-    if (existingUser.rows.length > 0) {
+    if (exists.rows.length > 0) {
       return res.status(409).json({ message: 'Ya existe una cuenta con este correo' });
     }
 
-    const passwordHash = await bcrypt.hash(password, 10);
+    const hash = await bcrypt.hash(password, 10);
 
     const result = await pool.query(
       `INSERT INTO users (name, email, password_hash)
-       VALUES ($1, $2, $3)
+       VALUES ($1,$2,$3)
        RETURNING id, name, email`,
-      [name.trim(), normalizedEmail, passwordHash],
+      [name.trim(), normalizedEmail, hash],
     );
 
     const user = result.rows[0];
     const token = createToken(user);
 
-    return res.status(201).json({ user, token });
-  } catch (error) {
-    console.error(error);
-    return res.status(500).json({ message: 'Error al registrar usuario' });
+    res.status(201).json({ user, token });
+  } catch {
+    res.status(500).json({ message: 'Error al registrar usuario' });
   }
 });
 
@@ -148,340 +128,198 @@ app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
 
-    const normalizedEmail = email.trim().toLowerCase();
-
-    const result = await pool.query('SELECT id, name, email, password_hash FROM users WHERE email = $1', [
-      normalizedEmail,
-    ]);
+    const result = await pool.query('SELECT * FROM users WHERE email = $1', [email.trim().toLowerCase()]);
 
     if (result.rows.length === 0) {
-      return res.status(401).json({ message: 'Correo o contraseña incorrectos' });
+      return res.status(401).json({ message: 'Credenciales incorrectas' });
     }
 
     const user = result.rows[0];
 
-    const passwordOk = await bcrypt.compare(password, user.password_hash);
+    const valid = await bcrypt.compare(password, user.password_hash);
 
-    if (!passwordOk) {
-      return res.status(401).json({ message: 'Correo o contraseña incorrectos' });
+    if (!valid) {
+      return res.status(401).json({ message: 'Credenciales incorrectas' });
     }
 
-    const safeUser = {
-      id: user.id,
-      name: user.name,
-      email: user.email,
-    };
-
+    const safeUser = { id: user.id, name: user.name, email: user.email };
     const token = createToken(safeUser);
 
-    return res.json({ user: safeUser, token });
-  } catch (error) {
-    console.error(error);
-    return res.status(500).json({ message: 'Error al iniciar sesión' });
+    res.json({ user: safeUser, token });
+  } catch {
+    res.status(500).json({ message: 'Error login' });
+  }
+});
+
+app.put('/api/users/me', authMiddleware, async (req, res) => {
+  try {
+    const { name, email } = req.body;
+
+    const result = await pool.query(
+      `UPDATE users
+       SET name=$1, email=$2
+       WHERE id=$3
+       RETURNING id,name,email`,
+      [name.trim(), email.trim().toLowerCase(), req.user.id],
+    );
+
+    res.json(result.rows[0]);
+  } catch {
+    res.status(500).json({ message: 'Error actualizando usuario' });
+  }
+});
+
+app.delete('/api/users/me', authMiddleware, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM users WHERE id = $1', [req.user.id]);
+    res.json({ message: 'Cuenta eliminada' });
+  } catch {
+    res.status(500).json({ message: 'Error eliminando usuario' });
   }
 });
 
 app.get('/api/movements', authMiddleware, async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT 
-        id,
-        user_id AS "userId",
-        type,
-        concept,
-        category,
-        amount,
-        TO_CHAR(date, 'YYYY-MM-DD') AS date,
-        is_recurring AS "isRecurring",
-        recurring_day AS "recurringDay",
-        recurring_parent_id AS "recurringParentId",
-        is_shopping_movement AS "isShoppingMovement",
-        created_automatically AS "createdAutomatically",
-        products
-      FROM movements
-      WHERE user_id = $1
-      ORDER BY date DESC, id DESC`,
-      [req.user.id],
-    );
+  const result = await pool.query(
+    `SELECT 
+      id,
+      user_id AS "userId",
+      type,
+      concept,
+      category,
+      amount,
+      TO_CHAR(date,'YYYY-MM-DD') AS date,
+      is_shopping_movement AS "isShoppingMovement",
+      created_automatically AS "createdAutomatically",
+      products
+     FROM movements
+     WHERE user_id=$1
+     ORDER BY date DESC`,
+    [req.user.id],
+  );
 
-    return res.json(result.rows);
-  } catch (error) {
-    console.error(error);
-    return res.status(500).json({ message: 'Error al obtener movimientos' });
-  }
+  res.json(result.rows);
 });
 
 app.post('/api/movements', authMiddleware, async (req, res) => {
-  try {
-    const {
+  const {
+    type,
+    concept,
+    category,
+    amount,
+    date,
+    isShoppingMovement = false,
+    createdAutomatically = false,
+    products = [],
+  } = req.body;
+
+  const result = await pool.query(
+    `INSERT INTO movements
+     (user_id,type,concept,category,amount,date,is_shopping_movement,created_automatically,products)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+     RETURNING 
+      id,
+      user_id AS "userId",
+      type,
+      concept,
+      category,
+      amount,
+      TO_CHAR(date,'YYYY-MM-DD') AS date,
+      is_shopping_movement AS "isShoppingMovement",
+      created_automatically AS "createdAutomatically",
+      products`,
+    [
+      req.user.id,
       type,
       concept,
       category,
       amount,
       date,
-      isRecurring = false,
-      recurringDay = null,
-      recurringParentId = null,
-      isShoppingMovement = false,
-      createdAutomatically = false,
-      products = [],
-    } = req.body;
+      isShoppingMovement,
+      createdAutomatically,
+      JSON.stringify(products),
+    ],
+  );
 
-    if (!type || !concept || !category || !amount || !date) {
-      return res.status(400).json({ message: 'Faltan datos obligatorios del movimiento' });
-    }
-
-    const result = await pool.query(
-      `INSERT INTO movements (
-        user_id,
-        type,
-        concept,
-        category,
-        amount,
-        date,
-        is_recurring,
-        recurring_day,
-        recurring_parent_id,
-        is_shopping_movement,
-        created_automatically,
-        products
-      )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-      RETURNING 
-        id,
-        user_id AS "userId",
-        type,
-        concept,
-        category,
-        amount,
-        TO_CHAR(date, 'YYYY-MM-DD') AS date,
-        is_recurring AS "isRecurring",
-        recurring_day AS "recurringDay",
-        recurring_parent_id AS "recurringParentId",
-        is_shopping_movement AS "isShoppingMovement",
-        created_automatically AS "createdAutomatically",
-        products`,
-      [
-        req.user.id,
-        type,
-        concept,
-        category,
-        amount,
-        date,
-        isRecurring,
-        recurringDay,
-        recurringParentId,
-        isShoppingMovement,
-        createdAutomatically,
-        JSON.stringify(products),
-      ],
-    );
-
-    return res.status(201).json(result.rows[0]);
-  } catch (error) {
-    console.error(error);
-    return res.status(500).json({ message: 'Error al crear movimiento' });
-  }
+  res.json(result.rows[0]);
 });
 
 app.put('/api/movements/:id', authMiddleware, async (req, res) => {
-  try {
-    const {
+  const { type, concept, category, amount, date, products = [] } = req.body;
+
+  const result = await pool.query(
+    `UPDATE movements
+     SET type=$1,concept=$2,category=$3,amount=$4,date=$5,products=$6
+     WHERE id=$7 AND user_id=$8
+     RETURNING 
+      id,
+      user_id AS "userId",
       type,
       concept,
       category,
       amount,
-      date,
-      isRecurring = false,
-      recurringDay = null,
-      recurringParentId = null,
-      isShoppingMovement = false,
-      createdAutomatically = false,
-      products = [],
-    } = req.body;
+      TO_CHAR(date,'YYYY-MM-DD') AS date,
+      products`,
+    [type, concept, category, amount, date, JSON.stringify(products), req.params.id, req.user.id],
+  );
 
-    if (!type || !concept || !category || !amount || !date) {
-      return res.status(400).json({ message: 'Faltan datos obligatorios del movimiento' });
-    }
-
-    const result = await pool.query(
-      `UPDATE movements
-       SET type = $1,
-           concept = $2,
-           category = $3,
-           amount = $4,
-           date = $5,
-           is_recurring = $6,
-           recurring_day = $7,
-           recurring_parent_id = $8,
-           is_shopping_movement = $9,
-           created_automatically = $10,
-           products = $11
-       WHERE id = $12 AND user_id = $13
-       RETURNING
-        id,
-        user_id AS "userId",
-        type,
-        concept,
-        category,
-        amount,
-        TO_CHAR(date, 'YYYY-MM-DD') AS date,
-        is_recurring AS "isRecurring",
-        recurring_day AS "recurringDay",
-        recurring_parent_id AS "recurringParentId",
-        is_shopping_movement AS "isShoppingMovement",
-        created_automatically AS "createdAutomatically",
-        products`,
-      [
-        type,
-        concept,
-        category,
-        amount,
-        date,
-        isRecurring,
-        recurringDay,
-        recurringParentId,
-        isShoppingMovement,
-        createdAutomatically,
-        JSON.stringify(products),
-        req.params.id,
-        req.user.id,
-      ],
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ message: 'Movimiento no encontrado' });
-    }
-
-    return res.json(result.rows[0]);
-  } catch (error) {
-    console.error(error);
-    return res.status(500).json({ message: 'Error al actualizar movimiento' });
-  }
+  res.json(result.rows[0]);
 });
 
 app.delete('/api/movements/:id', authMiddleware, async (req, res) => {
-  try {
-    await pool.query('DELETE FROM movements WHERE id = $1 AND user_id = $2', [req.params.id, req.user.id]);
-
-    return res.json({ message: 'Movimiento eliminado' });
-  } catch (error) {
-    console.error(error);
-    return res.status(500).json({ message: 'Error al eliminar movimiento' });
-  }
+  await pool.query('DELETE FROM movements WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
+  res.json({ message: 'Eliminado' });
 });
 
 app.get('/api/budgets', authMiddleware, async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT
-        id,
-        user_id AS "userId",
-        month,
-        category,
-        limit_amount AS "limit",
-        created_at AS "createdAt"
-      FROM budgets
-      WHERE user_id = $1
-      ORDER BY month DESC, category ASC`,
-      [req.user.id],
-    );
+  const result = await pool.query(
+    `SELECT 
+      id,
+      user_id AS "userId",
+      month,
+      category,
+      limit_amount AS "limit"
+     FROM budgets
+     WHERE user_id=$1`,
+    [req.user.id],
+  );
 
-    return res.json(result.rows);
-  } catch (error) {
-    console.error(error);
-    return res.status(500).json({ message: 'Error al obtener presupuestos' });
-  }
+  res.json(result.rows);
 });
 
 app.post('/api/budgets', authMiddleware, async (req, res) => {
-  try {
-    const { month, category, limit } = req.body;
+  const { month, category, limit } = req.body;
 
-    if (!month || !category || !limit || Number(limit) <= 0) {
-      return res.status(400).json({ message: 'Datos de presupuesto inválidos' });
-    }
+  const result = await pool.query(
+    `INSERT INTO budgets (user_id,month,category,limit_amount)
+     VALUES ($1,$2,$3,$4)
+     RETURNING id,user_id AS "userId",month,category,limit_amount AS "limit"`,
+    [req.user.id, month, category, limit],
+  );
 
-    const result = await pool.query(
-      `INSERT INTO budgets (
-        user_id,
-        month,
-        category,
-        limit_amount
-      )
-      VALUES ($1,$2,$3,$4)
-      RETURNING
-        id,
-        user_id AS "userId",
-        month,
-        category,
-        limit_amount AS "limit",
-        created_at AS "createdAt"`,
-      [req.user.id, month, category, limit],
-    );
-
-    return res.status(201).json(result.rows[0]);
-  } catch (error) {
-    console.error(error);
-    return res.status(500).json({ message: 'Error al crear presupuesto' });
-  }
+  res.json(result.rows[0]);
 });
 
 app.put('/api/budgets/:id', authMiddleware, async (req, res) => {
-  try {
-    const { month, category, limit } = req.body;
+  const { month, category, limit } = req.body;
 
-    if (!month || !category || !limit || Number(limit) <= 0) {
-      return res.status(400).json({ message: 'Datos de presupuesto inválidos' });
-    }
+  const result = await pool.query(
+    `UPDATE budgets
+     SET month=$1,category=$2,limit_amount=$3
+     WHERE id=$4 AND user_id=$5
+     RETURNING id,user_id AS "userId",month,category,limit_amount AS "limit"`,
+    [month, category, limit, req.params.id, req.user.id],
+  );
 
-    const result = await pool.query(
-      `UPDATE budgets
-       SET month = $1,
-           category = $2,
-           limit_amount = $3
-       WHERE id = $4 AND user_id = $5
-       RETURNING
-        id,
-        user_id AS "userId",
-        month,
-        category,
-        limit_amount AS "limit",
-        created_at AS "createdAt"`,
-      [month, category, limit, req.params.id, req.user.id],
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ message: 'Presupuesto no encontrado' });
-    }
-
-    return res.json(result.rows[0]);
-  } catch (error) {
-    console.error(error);
-    return res.status(500).json({ message: 'Error al actualizar presupuesto' });
-  }
+  res.json(result.rows[0]);
 });
 
 app.delete('/api/budgets/:id', authMiddleware, async (req, res) => {
-  try {
-    await pool.query('DELETE FROM budgets WHERE id = $1 AND user_id = $2', [req.params.id, req.user.id]);
-
-    return res.json({ message: 'Presupuesto eliminado' });
-  } catch (error) {
-    console.error(error);
-    return res.status(500).json({ message: 'Error al eliminar presupuesto' });
-  }
+  await pool.query('DELETE FROM budgets WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
+  res.json({ message: 'Eliminado' });
 });
 
 const PORT = process.env.PORT || 3000;
 
-initDatabase()
-  .then(() => {
-    app.listen(PORT, () => {
-      console.log(`EasyBudget API escuchando en puerto ${PORT}`);
-    });
-  })
-  .catch((error) => {
-    console.error('Error inicializando base de datos:', error);
-    process.exit(1);
-  });
+initDatabase().then(() => {
+  app.listen(PORT, () => console.log(`API corriendo en puerto ${PORT}`));
+});
